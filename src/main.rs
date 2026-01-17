@@ -1,31 +1,65 @@
+use std::io::{stdout, Write};
 use std::net::UdpSocket;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-// smoothing factor for exponential low pass filter (0.0 = no smoothing, 1.0 = frozen)
-// higher values can be smoother but more latency. keep it between 0.7-0.85
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    ExecutableCommand,
+};
+
+
+// smoothing: higher = smoother but more latency (0.0 - 0.99)
 const SMOOTHING_FACTOR: f64 = 0.75;
 
-// yaw rotation needed for full left/right pan
-// lower = more sensitive, default: 30.0 (±30° for full pan)
-const YAW_SENSITIVITY: f64 = 30.0;
+// min time between updates (20ms = ~50fps)
+const UPDATE_RATE_MS: u64 = 20;
 
-// degrees for pitch for volume adjustment range
-// looking up by this amount = MAX_VOLUME, down = MIN_VOLUME
-const PITCH_SENSITIVITY: f64 = 20.0;
+// only send command if angle changes by this many degrees
+const CHANGE_THRESHOLD: f64 = 0.5;
 
-// dead zone in center, no panning within this range
-const DEAD_ZONE: f64 = 5.0;
+// default radius, can change at runtime
+const DEFAULT_RADIUS: f64 = 1.5;
+const MIN_RADIUS: f64 = 0.1;
+const MAX_RADIUS: f64 = 10.0;
+const RADIUS_STEP: f64 = 0.1;
 
-// min time between updates in ms (33ms ~= 30fps, 50ms = 20fps)
-const UPDATE_RATE_MS: u64 = 40;
+// speaker angles for front and back modes
+const FRONT_LEFT_ANGLE: f64 = 30.0;   // +30° (front-left)
+const FRONT_RIGHT_ANGLE: f64 = -30.0; // -30° (front-right)
+const BACK_LEFT_ANGLE: f64 = 150.0;   // +150° (back-left)
+const BACK_RIGHT_ANGLE: f64 = -150.0; // -150° (back-right)
 
-// vol range for pitch control
-const MIN_VOLUME: f64 = 0.3;
-const MAX_VOLUME: f64 = 1.0;
+// node name to search for in pipewire
+const SPATIALIZER_NODE_NAME: &str = "effect_input.spatializer";
 
-// min channel volume (makes sure there's no complete silence on one side)
-const MIN_CHANNEL: f64 = 0.05;
+// ==============================================================================
+// DATA STRUCTURES
+// ==============================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+enum SpeakerMode {
+    Front,
+    Back,
+}
+
+impl SpeakerMode {
+    fn label(&self) -> &'static str {
+        match self {
+            SpeakerMode::Front => "FRONT",
+            SpeakerMode::Back => "BACK",
+        }
+    }
+
+    fn base_angles(&self) -> (f64, f64) {
+        match self {
+            SpeakerMode::Front => (FRONT_LEFT_ANGLE, FRONT_RIGHT_ANGLE),
+            SpeakerMode::Back => (BACK_LEFT_ANGLE, BACK_RIGHT_ANGLE),
+        }
+    }
+}
 
 struct SmoothedState {
     yaw: f64,
@@ -35,14 +69,10 @@ struct SmoothedState {
 
 impl SmoothedState {
     fn new() -> Self {
-        Self {
-            yaw: 0.0,
-            pitch: 0.0,
-            roll: 0.0,
-        }
+        Self { yaw: 0.0, pitch: 0.0, roll: 0.0 }
     }
 
-    // apply exponential smoothing: smoothed = α * previous + (1 - α) * current
+        // apply exponential smoothing: smoothed = α * previous + (1 - α) * current
     fn update(&mut self, raw_yaw: f64, raw_pitch: f64, raw_roll: f64) {
         self.yaw = SMOOTHING_FACTOR * self.yaw + (1.0 - SMOOTHING_FACTOR) * raw_yaw;
         self.pitch = SMOOTHING_FACTOR * self.pitch + (1.0 - SMOOTHING_FACTOR) * raw_pitch;
@@ -50,56 +80,51 @@ impl SmoothedState {
     }
 }
 
-// audio control
-struct AudioState {
-    left: f64,
-    right: f64,
-    volume: f64,
-    effective_yaw: f64,
+// holds the calculated positions for the virtual speakers relative to head
+struct SpatialState {
+    left_az: f64,
+    right_az: f64,
+    elevation: f64,
+    radius: f64,
+    gain: f64, // volume scaling based on radius (1.0 / radius)
 }
 
-impl AudioState {
-    fn from_head_tracking(yaw: f64, pitch: f64) -> Self {
-        // apply dead zone to yaw
-        let effective_yaw = if yaw.abs() < DEAD_ZONE {
-            0.0
-        } else {
-            // rm dead zone from the value
-            let sign = yaw.signum();
-            sign * (yaw.abs() - DEAD_ZONE)
-        };
+impl SpatialState {
+    fn from_head_tracking(yaw: f64, pitch: f64, radius: f64, mode: SpeakerMode) -> Self {
+        // get base speaker angles based on mode
+        let (left_base, right_base) = mode.base_angles();
 
-        // normalize yaw to pan: -YAW_SENSITIVITY..+YAW_SENSITIVITY -> 0..1
-        let max_yaw = YAW_SENSITIVITY - DEAD_ZONE;
-        let normalized = (effective_yaw.clamp(-max_yaw, max_yaw) / max_yaw + 1.0) / 2.0;
+        // relative azimuth = base_pos - head_yaw
+        let left_az = left_base - yaw;
+        let right_az = right_base - yaw;
 
-        // calculate stereo balance
-        let left = (1.0 - normalized).max(MIN_CHANNEL);
-        let right = normalized.max(MIN_CHANNEL);
+        // pitch is inverted (looking up moves the source down relative to eyes)
+        let elevation = -pitch;
 
-        //  calculate volume (pitch), looking up = louder vice versa
-        let pitch_normalized = (pitch.clamp(-PITCH_SENSITIVITY, PITCH_SENSITIVITY)
-            / PITCH_SENSITIVITY + 1.0) / 2.0;
-        let volume = MIN_VOLUME + pitch_normalized * (MAX_VOLUME - MIN_VOLUME);
+        // calculate gain: inverse relationship with radius
+        // at radius 1.0 = 100% gain, radius 2.0 = 50% gain, etc.
+        // clamp to reasonable range
+        let gain = (1.0 / radius).clamp(0.1, 2.0);
 
-        Self {
-            left: left * volume,
-            right: right * volume,
-            volume,
-            effective_yaw,
-        }
+        Self { left_az, right_az, elevation, radius, gain }
     }
 }
 
-// display
+// ==============================================================================
+// DISPLAY HELPERS
+// ==============================================================================
 
-// clear screen and move cursor to top-left
 fn clear_screen() {
-    print!("\x1B[2J\x1B[1;1H");
+    stdout()
+        .execute(Clear(ClearType::All))
+        .ok();
+    stdout()
+        .execute(cursor::MoveTo(0, 0))
+        .ok();
 }
 
-// Helper: Calculate string width ignoring ANSI color codes
-// Fixes border alignment by counting emojis as 2 width
+// helper: calculate string width ignoring ansi color codes
+// fixes border alignment by counting emojis as 2 width
 fn get_visible_width(s: &str) -> usize {
     let mut width = 0;
     let mut inside_ansi = false;
@@ -114,49 +139,34 @@ fn get_visible_width(s: &str) -> usize {
             }
             continue;
         }
-        // Account for double-width emojis used in headers
+        // account for double-width emojis used in headers
         match c {
-            '🎧' | '📊' | '🔊' | '📈' => width += 2,
+            '🎧' | '📊' | '🔊' | '📈' | '📡' => width += 2,
             _ => width += 1,
         }
     }
     width
 }
 
-// create an ASCII pan indicator bar
-fn render_pan_bar(yaw: f64, width: usize) -> String {
-    let half = width / 2;
-    let normalized = (yaw.clamp(-YAW_SENSITIVITY, YAW_SENSITIVITY) / YAW_SENSITIVITY + 1.0) / 2.0;
-    let pos = (normalized * (width - 1) as f64).round() as usize;
-
-    let mut bar = String::with_capacity(width + 10);
+// render an azimuth position bar showing where a speaker is relative to center
+fn render_azimuth_bar(azimuth: f64, width: usize) -> String {
+    let mut bar = String::with_capacity(width + 20);
     bar.push('[');
 
+    // map azimuth (-180..180) to bar position
+    // clamp to reasonable range for display
+    let clamped = azimuth.clamp(-90.0, 90.0);
+    let normalized = (clamped + 90.0) / 180.0; // 0..1
+    let pos = (normalized * (width - 1) as f64).round() as usize;
+    let center_idx = width / 2;
+
     for i in 0..width {
-        if i == half {
-            if pos == i {
-                bar.push_str("\x1B[1;33m┃\x1B[0m"); // yellow center marker when at center
-            } else {
-                bar.push('│');
-            }
-        } else if i == pos {
-            if i < half {
-                bar.push_str("\x1B[1;33m◀\x1B[0m"); // blue left indicator
-            } else {
-                bar.push_str("\x1B[1;35m▶\x1B[0m"); // red right indicator
-            }
-        } else if i < half {
-            if i >= pos && pos < half {
-                bar.push_str("\x1B[33m━\x1B[0m");
-            } else {
-                bar.push('─');
-            }
+        if i == pos {
+            bar.push_str("\x1B[1;33m◆\x1B[0m"); // speaker position marker
+        } else if i == center_idx {
+            bar.push_str("\x1B[90m│\x1B[0m"); // center line
         } else {
-            if i <= pos && pos > half {
-                bar.push_str("\x1B[35m━\x1B[0m");
-            } else {
-                bar.push('─');
-            }
+            bar.push(' ');
         }
     }
 
@@ -164,29 +174,15 @@ fn render_pan_bar(yaw: f64, width: usize) -> String {
     bar
 }
 
-// vol bar
-fn render_volume_bar(volume: f64, width: usize) -> String {
-    let filled = ((volume / MAX_VOLUME) * width as f64).round() as usize;
-    let mut bar = String::with_capacity(width + 10);
-    bar.push('[');
-
-    for i in 0..width {
-        if i < filled {
-            let intensity = i as f64 / width as f64;
-            if intensity < 0.5 {
-                bar.push_str("\x1B[32m█\x1B[0m"); // green
-            } else if intensity < 0.8 {
-                bar.push_str("\x1B[33m█\x1B[0m"); // yellow
-            } else {
-                bar.push_str("\x1B[31m█\x1B[0m"); // red
-            }
-        } else {
-            bar.push('░');
-        }
+// render an elevation indicator
+fn render_elevation_indicator(elevation: f64) -> &'static str {
+    if elevation > 10.0 {
+        "⬆ Above"
+    } else if elevation < -10.0 {
+        "⬇ Below"
+    } else {
+        "━ Level"
     }
-
-    bar.push(']');
-    bar
 }
 
 fn render_dashboard(
@@ -194,193 +190,324 @@ fn render_dashboard(
     raw_yaw: f64,
     raw_pitch: f64,
     raw_roll: f64,
-    audio: &AudioState,
+    spatial: &SpatialState,
     fps: f64,
-    streams: usize,
-    packets: u64,
+    node_id: &Option<String>,
     latency_ms: f64,
+    packets: u64,
+    mode: SpeakerMode,
 ) {
     clear_screen();
 
-    // Helper closure to draw a bordered row with dynamic padding
-    // fixes the "sticking with text" issue by ensuring strict 66-char inner width
     let draw_row = |content: &str| {
         let inner_target = 66;
         let visible = get_visible_width(content);
         let padding = if inner_target > visible { inner_target - visible } else { 0 };
-        println!("\x1B[1;96m║\x1B[0m{}{}\x1B[1;96m║\x1B[0m", content, " ".repeat(padding));
+        print!("\x1B[1;96m║\x1B[0m{}{}\x1B[1;96m║\x1B[0m\r\n", content, " ".repeat(padding));
     };
 
-    // Helper to pad a specific field to a visual width, preserving ANSI codes
     let pad_field = |text: String, width: usize| -> String {
         let vis = get_visible_width(&text);
         let p = if width > vis { width - vis } else { 0 };
         format!("{}{}", text, " ".repeat(p))
     };
 
-    println!("\x1B[1;96m╔══════════════════════════════════════════════════════════════════╗\x1B[0m");
-    // Header - manual center calc for simplicity
-    let title = "\x1B[1;37m🎧 HEAD TRACKING AUDIO PANNER\x1B[0m";
+    print!("\x1B[1;96m╔══════════════════════════════════════════════════════════════════╗\x1B[0m\r\n");
+
+    let title = "\x1B[1;37m🎧 SPATIAL AUDIO ENGINE (HRTF STEREO)\x1B[0m";
     let t_vis = get_visible_width(title);
     let t_pad = (66 - t_vis) / 2;
-    println!("\x1B[1;96m║\x1B[0m{}{}{}\x1B[1;96m║\x1B[0m", " ".repeat(t_pad), title, " ".repeat(66 - t_vis - t_pad));
-    println!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m");
+    print!("\x1B[1;96m║\x1B[0m{}{}{}\x1B[1;96m║\x1B[0m\r\n", " ".repeat(t_pad), title, " ".repeat(66 - t_vis - t_pad));
+    print!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m\r\n");
 
-    // raw vs smoothed
-    draw_row(&format!("  {}", "\x1B[1;33m📊 HEAD ORIENTATION\x1B[0m"));
+    draw_row(&format!("  {}", "\x1B[1;33m📊 HEAD TRACKING\x1B[0m"));
     draw_row("");
-    draw_row(&format!("    {}",
-                      format!("\x1B[90mRAW:\x1B[0m     Yaw={:>7.1}°  Pitch={:>7.1}°  Roll={:>7.1}°",
-                              raw_yaw, raw_pitch, raw_roll)));
-    draw_row(&format!("    {}",
-                      format!("\x1B[1;37mSMOOTH:\x1B[0m  Yaw={:>7.1}°  Pitch={:>7.1}°  Roll={:>7.1}°",
-                              smoothed.yaw, smoothed.pitch, smoothed.roll)));
+    draw_row(&format!("    \x1B[90mRAW:\x1B[0m     Yaw={:>7.1}°  Pitch={:>7.1}°  Roll={:>7.1}°",
+                      raw_yaw, raw_pitch, raw_roll));
+    draw_row(&format!("    \x1B[1;37mSMOOTH:\x1B[0m  Yaw={:>7.1}°  Pitch={:>7.1}°  Roll={:>7.1}°",
+                      smoothed.yaw, smoothed.pitch, smoothed.roll));
 
-    // dead zone
-    let dead_zone_status = if smoothed.yaw.abs() < DEAD_ZONE {
-        "\x1B[1;32m● DEAD ZONE (centered)\x1B[0m"
-    } else {
-        "\x1B[90m○ active tracking\x1B[0m"
+    draw_row("");
+    print!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m\r\n");
+
+    let mode_color = match mode {
+        SpeakerMode::Front => "\x1B[1;32m",
+        SpeakerMode::Back => "\x1B[1;33m",
     };
-    draw_row(&format!("    Status: {}", dead_zone_status));
-
-    draw_row("");
-    println!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m");
-
-    // audio section
-    draw_row(&format!("  {}", "\x1B[1;35m🔊 AUDIO OUTPUT\x1B[0m"));
+    draw_row(&format!("  \x1B[1;35m🔊 VIRTUAL SPEAKERS\x1B[0m  [{}{}°\x1B[0m]", mode_color, mode.label()));
     draw_row("");
 
-    // pan bar
-    let pan_bar = render_pan_bar(audio.effective_yaw, 40);
-    draw_row(&format!("    \x1B[1;37mPAN:\x1B[0m  L {} R", pan_bar));
+    let l_bar = render_azimuth_bar(spatial.left_az, 24);
+    draw_row(&format!("    \x1B[1;36mLeft Speaker:\x1B[0m  {}  {:>+6.1}°", l_bar, spatial.left_az));
 
-    // channel levels
-    draw_row(&format!("          Left={:.2}  Right={:.2}  (effective yaw: {:>+.1}°)",
-                      audio.left, audio.right, audio.effective_yaw));
+    let r_bar = render_azimuth_bar(spatial.right_az, 24);
+    draw_row(&format!("    \x1B[1;35mRight Speaker:\x1B[0m {}  {:>+6.1}°", r_bar, spatial.right_az));
 
     draw_row("");
 
-    // vol bar
-    let vol_bar = render_volume_bar(audio.volume, 40);
-    draw_row(&format!("    \x1B[1;37mVOL:\x1B[0m  {} {:>3.0}%", vol_bar, audio.volume * 100.0));
+    let elev_indicator = render_elevation_indicator(spatial.elevation);
+    draw_row(&format!("    \x1B[1;37mElevation:\x1B[0m {:>+6.1}°  {}", spatial.elevation, elev_indicator));
 
-    // pitch indicator
-    let pitch_indicator = if smoothed.pitch > 5.0 {
-        "↑ looking UP (louder)"
-    } else if smoothed.pitch < -5.0 {
-        "↓ looking DOWN (quieter)"
-    } else {
-        "─ level"
+    let gain_pct = spatial.gain * 100.0;
+    draw_row(&format!("    \x1B[1;37mRadius:\x1B[0m    {:>6.2}m  (Gain: {:>3.0}%)", spatial.radius, gain_pct));
+
+    draw_row("");
+    print!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m\r\n");
+
+    draw_row(&format!("  {}", "\x1B[1;32m📡 CONNECTION\x1B[0m"));
+    draw_row("");
+
+    let status = match node_id {
+        Some(id) => format!("\x1B[1;32m✓ LINKED\x1B[0m to Node \x1B[1;37m{}\x1B[0m ({})", id, SPATIALIZER_NODE_NAME),
+        None => format!("\x1B[1;31m✗ SEARCHING\x1B[0m for '{}'...", SPATIALIZER_NODE_NAME),
     };
-    draw_row(&format!("          {}", pitch_indicator));
+    draw_row(&format!("    {}", status));
 
     draw_row("");
-    println!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m");
+    print!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m\r\n");
 
-    // stats section
-    draw_row(&format!("  {}", "\x1B[1;32m📈 STATS\x1B[0m"));
+    draw_row(&format!("  {}", "\x1B[1;34m📈 STATS\x1B[0m"));
     draw_row("");
 
-    // Stats alignment logic (2 columns)
     let col_width = 25;
 
-    // Row 1
     let fps_str = pad_field(format!("FPS: \x1B[1;37m{:>5.1}\x1B[0m", fps), col_width);
-    let lat_str = format!("Latency: \x1B[1;37m{:.2}ms\x1B[0m", latency_ms);
+    let lat_str = format!("Latency: \x1B[1;37m{:>5.2}ms\x1B[0m", latency_ms);
     draw_row(&format!("    {}  │  {}", fps_str, lat_str));
 
-    // Row 2
-    let strm_str = pad_field(format!("Streams: \x1B[1;37m{:>2}\x1B[0m", streams), col_width);
-    let pkts_str = format!("Packets: \x1B[1;37m{:>8}\x1B[0m", packets);
-    draw_row(&format!("    {}  │  {}", strm_str, pkts_str));
+    let pkts_str = pad_field(format!("Packets: \x1B[1;37m{}\x1B[0m", packets), col_width);
+    let thresh_str = format!("Threshold: \x1B[1;37m{:.1}°\x1B[0m", CHANGE_THRESHOLD);
+    draw_row(&format!("    {}  │  {}", pkts_str, thresh_str));
 
-    // Row 3
-    let smooth_str = pad_field(format!("Smoothing: {:.0}%", SMOOTHING_FACTOR * 100.0), col_width);
-    let dead_str = format!("Dead zone: ±{}°", DEAD_ZONE);
-    draw_row(&format!("    {}  │  {}", smooth_str, dead_str));
+    let smooth_str = pad_field(format!("Smoothing: \x1B[1;37m{:.0}%\x1B[0m", SMOOTHING_FACTOR * 100.0), col_width);
+    draw_row(&format!("    {}  │", smooth_str));
 
     draw_row("");
-    println!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m");
-    draw_row(&format!("  {}", "\x1B[90mPress Ctrl+C to exit\x1B[0m"));
-    println!("\x1B[1;96m╚══════════════════════════════════════════════════════════════════╝\x1B[0m");
+    print!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m\r\n");
+
+    draw_row(&format!("  {}", "\x1B[1;90m⌨ CONTROLS\x1B[0m"));
+    draw_row("    \x1B[90m↑/↓\x1B[0m Radius   \x1B[90mW\x1B[0m Front   \x1B[90mS\x1B[0m Back   \x1B[90mQ/Esc\x1B[0m Quit");
+    print!("\x1B[1;96m╚══════════════════════════════════════════════════════════════════╝\x1B[0m\r\n");
 }
+
+// ==============================================================================
+// PIPEWIRE CONTROL
+// ==============================================================================
+
+fn find_spatializer_node() -> Option<String> {
+        // run 'pw-cli ls Node'
+    let output = Command::new("pw-cli").args(["ls", "Node"]).output().ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    let mut current_id = String::new();
+
+    // simple state machine parser (no external deps)
+    for line in text.lines() {
+        let trim = line.trim();
+        if trim.starts_with("id") {
+            // "id 36, type PipeWire:Interface:Node..."
+            if let Some(id_part) = trim.split_whitespace().nth(1) {
+                current_id = id_part.trim_matches(',').to_string();
+            }
+        }
+        // check for our target node name
+        if trim.contains("node.name") && trim.contains(SPATIALIZER_NODE_NAME) {
+            return Some(current_id);
+        }
+    }
+    None
+}
+
+fn update_pipewire(id: &str, spatial: &SpatialState) {
+    // build the json for the stereo filter-chain
+    // sets params for both 'spat_left' and 'spat_right' nodes
+    // uses dynamic radius and includes gain for distance simulation
+    let json_payload = format!(
+        "{{ \"params\": [ \
+            \"spat_left:Azimuth\", {:.2}, \
+            \"spat_left:Elevation\", {:.2}, \
+            \"spat_left:Radius\", {:.2}, \
+            \"spat_left:Gain\", {:.2}, \
+            \"spat_right:Azimuth\", {:.2}, \
+            \"spat_right:Elevation\", {:.2}, \
+            \"spat_right:Radius\", {:.2}, \
+            \"spat_right:Gain\", {:.2} \
+        ] }}",
+        spatial.left_az, spatial.elevation, spatial.radius, spatial.gain,
+        spatial.right_az, spatial.elevation, spatial.radius, spatial.gain
+    );
+
+    // spawn async (fire and forget) to prevent frame drops
+    // redirect stdout/stderr to null to prevent tui artifacts
+    Command::new("pw-cli")
+        .args(["set-param", id, "Props", &json_payload])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok();
+}
+
+// ==============================================================================
+// MAIN
+// ==============================================================================
+
 fn main() {
-    // initial setup display
+    // enable raw mode for keyboard input
+    terminal::enable_raw_mode().expect("Failed to enable raw mode");
+    stdout().execute(EnterAlternateScreen).expect("Failed to enter alternate screen");
+
+    // make sure we cleanup on exit
+    let result = run_main_loop();
+
+    // cleanup terminal
+    terminal::disable_raw_mode().ok();
+    stdout().execute(LeaveAlternateScreen).ok();
+
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run_main_loop() -> Result<(), String> {
     clear_screen();
-    println!("\x1B[1;96m╔══════════════════════════════════════════════════════════════════╗\x1B[0m");
-    println!("\x1B[1;96m║\x1B[0m{:^66}\x1B[1;96m║\x1B[0m", "\x1B[1;37m🎧 HEAD TRACKING AUDIO PANNER\x1B[0m");
-    println!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m");
-    println!("\x1B[1;96m║\x1B[0m{:66}\x1B[1;96m║\x1B[0m", "");
-    println!("\x1B[1;96m║\x1B[0m  {:<64}\x1B[1;96m║\x1B[0m", "🔌 Binding to UDP port 4242...");
+    print!("\x1B[1;96m╔══════════════════════════════════════════════════════════════════╗\x1B[0m\r\n");
+    print!("\x1B[1;96m║\x1B[0m{:^66}\x1B[1;96m║\x1B[0m\r\n", "\x1B[1;37m🎧 SPATIAL AUDIO ENGINE\x1B[0m");
+    print!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m\r\n");
+    print!("\x1B[1;96m║\x1B[0m{:66}\x1B[1;96m║\x1B[0m\r\n", "");
+    print!("\x1B[1;96m║\x1B[0m  {:<64}\x1B[1;96m║\x1B[0m\r\n", "🔌 Binding to UDP port 4242...");
+    stdout().flush().ok();
 
     let socket = match UdpSocket::bind("127.0.0.1:4242") {
         Ok(s) => {
-            println!("\x1B[1;96m║\x1B[0m  {:<64}\x1B[1;96m║\x1B[0m", "\x1B[1;32m✓ Socket bound successfully!\x1B[0m");
+            print!("\x1B[1;96m║\x1B[0m  {:<64}\x1B[1;96m║\x1B[0m\r\n", "\x1B[1;32m✓ Socket bound successfully!\x1B[0m");
             s
         }
         Err(e) => {
-            eprintln!("\x1B[1;96m║\x1B[0m  \x1B[1;31m✗ FAILED to bind socket: {}\x1B[0m", e);
-            std::process::exit(1);
+            return Err(format!("Failed to bind socket: {}", e));
         }
     };
 
-    socket
-        .set_read_timeout(Some(Duration::from_millis(UPDATE_RATE_MS / 2)))
-        .expect("Failed to set timeout");
+    socket.set_read_timeout(Some(Duration::from_millis(10))).ok();
 
-    println!("\x1B[1;96m║\x1B[0m{:66}\x1B[1;96m║\x1B[0m", "");
-    println!("\x1B[1;96m║\x1B[0m  {:<64}\x1B[1;96m║\x1B[0m", "\x1B[1;33m⏳ Waiting for OpenTrack data...\x1B[0m");
-    println!("\x1B[1;96m║\x1B[0m     {:<61}\x1B[1;96m║\x1B[0m", "Make sure OpenTrack is sending UDP to 127.0.0.1:4242");
-    println!("\x1B[1;96m║\x1B[0m{:66}\x1B[1;96m║\x1B[0m", "");
-    println!("\x1B[1;96m╚══════════════════════════════════════════════════════════════════╝\x1B[0m");
+    print!("\x1B[1;96m║\x1B[0m{:66}\x1B[1;96m║\x1B[0m\r\n", "");
+    print!("\x1B[1;96m║\x1B[0m  {:<64}\x1B[1;96m║\x1B[0m\r\n",
+             format!("🔍 Searching for '{}'...", SPATIALIZER_NODE_NAME));
+    print!("\x1B[1;96m║\x1B[0m  {:<64}\x1B[1;96m║\x1B[0m\r\n", "\x1B[1;33m⏳ Waiting for OpenTrack data...\x1B[0m");
+    print!("\x1B[1;96m║\x1B[0m     {:<61}\x1B[1;96m║\x1B[0m\r\n", "Make sure OpenTrack is sending UDP to 127.0.0.1:4242");
+    print!("\x1B[1;96m║\x1B[0m{:66}\x1B[1;96m║\x1B[0m\r\n", "");
+    print!("\x1B[1;96m╚══════════════════════════════════════════════════════════════════╝\x1B[0m\r\n");
+    stdout().flush().ok();
 
     let mut buf = [0u8; 48];
-    let mut last_update = Instant::now();
-    let mut last_fps_calc = Instant::now();
-    let mut packet_count: u64 = 0;
-    let mut frame_count: u32 = 0;
-    let mut current_fps: f64 = 0.0;
-    let mut stream_count: usize = 0;
     let mut smoothed = SmoothedState::new();
-    let mut first_packet = true;
 
-    // raw values for display comp
-    let (mut raw_yaw, mut raw_pitch, mut raw_roll) = (0.0_f64, 0.0_f64, 0.0_f64);
+    // state tracking
+    let mut cached_node_id: Option<String> = None;
+    let mut last_node_search = Instant::now();
+    let mut last_update_time = Instant::now();
+
+    // fps calculation
+    let mut frame_count: u32 = 0;
+    let mut last_fps_calc = Instant::now();
+    let mut current_fps: f64 = 0.0;
+
+    // packet counter
+    let mut packet_count: u64 = 0;
+
+    // don't spam pipewire if head hasn't moved
+    let mut last_sent_yaw: f64 = f64::MAX;
+    let mut last_sent_pitch: f64 = f64::MAX;
+    let mut last_sent_radius: f64 = f64::MAX;
 
     // latency tracking
     let mut latency_samples: Vec<f64> = Vec::with_capacity(30);
     let mut avg_latency_ms: f64 = 0.0;
 
+    // raw values for display (set on first packet)
+    let (mut raw_yaw, mut raw_pitch, mut raw_roll): (f64, f64, f64);
+
+    // dynamic state: radius and speaker mode
+    let mut current_radius: f64 = DEFAULT_RADIUS;
+    let mut speaker_mode: SpeakerMode = SpeakerMode::Front;
+
+    // flag to force update when user changes settings
+    let mut force_update = false;
+
     loop {
+        // 1. handle keyboard input (non-blocking)
+        if event::poll(Duration::from_secs(0)).unwrap_or(false) {
+            if let Ok(Event::Key(key_event)) = event::read() {
+                match handle_key_event(key_event, &mut current_radius, &mut speaker_mode) {
+                    KeyAction::Quit => break,
+                    KeyAction::Changed => {
+                        force_update = true;
+                    }
+                    KeyAction::None => {}
+                }
+            }
+        }
+
+        // 2. periodically search for node id if not found
+        if cached_node_id.is_none() && last_node_search.elapsed().as_secs() > 2 {
+            cached_node_id = find_spatializer_node();
+            last_node_search = Instant::now();
+        }
+
+        // 3. read udp packet
         match socket.recv_from(&mut buf) {
-            Ok((amt, _addr)) => {
-                let recv_time = Instant::now();
+            Ok((48, _)) => {
                 packet_count += 1;
 
-                if amt != 48 {
-                    continue;
-                }
-
-                // parse
+                // parse opentrack data: [x, y, z, yaw, pitch, roll] as f64
                 let data: [f64; 6] = unsafe { std::mem::transmute(buf) };
                 raw_yaw = data[3];
                 raw_pitch = data[4];
                 raw_roll = data[5];
 
-                // smoothing
+                // apply smoothing
                 smoothed.update(raw_yaw, raw_pitch, raw_roll);
 
-                // rate limit display updates
-                if last_update.elapsed() < Duration::from_millis(UPDATE_RATE_MS) {
+                // 4. rate limit updates
+                if last_update_time.elapsed() < Duration::from_millis(UPDATE_RATE_MS) && !force_update {
                     continue;
                 }
 
-                if first_packet {
-                    first_packet = false;
+                // calculate spatial positions with current radius and mode
+                let spatial = SpatialState::from_head_tracking(
+                    smoothed.yaw,
+                    smoothed.pitch,
+                    current_radius,
+                    speaker_mode,
+                );
+
+                // 5. send to pipewire (only if changed enough to avoid spamming, or forced)
+                if let Some(ref id) = cached_node_id {
+                    let yaw_changed = (smoothed.yaw - last_sent_yaw).abs() > CHANGE_THRESHOLD;
+                    let pitch_changed = (smoothed.pitch - last_sent_pitch).abs() > CHANGE_THRESHOLD;
+                    let radius_changed = (current_radius - last_sent_radius).abs() > 0.01;
+
+                    if yaw_changed || pitch_changed || radius_changed || force_update {
+                        let start = Instant::now();
+                        update_pipewire(id, &spatial);
+                        let cmd_latency = start.elapsed().as_secs_f64() * 1000.0;
+
+                        // track latency samples for averaging
+                        latency_samples.push(cmd_latency);
+                        if latency_samples.len() > 30 {
+                            latency_samples.remove(0);
+                        }
+                        avg_latency_ms = latency_samples.iter().sum::<f64>() / latency_samples.len() as f64;
+
+                        last_sent_yaw = smoothed.yaw;
+                        last_sent_pitch = smoothed.pitch;
+                        last_sent_radius = current_radius;
+                    }
                 }
 
-                // calculate FPS
+                force_update = false;
+
+                // 6. fps calculation
                 frame_count += 1;
                 if last_fps_calc.elapsed() >= Duration::from_secs(1) {
                     current_fps = frame_count as f64 / last_fps_calc.elapsed().as_secs_f64();
@@ -388,108 +515,86 @@ fn main() {
                     last_fps_calc = Instant::now();
                 }
 
-                // calculate audio parameters
-                let audio = AudioState::from_head_tracking(smoothed.yaw, smoothed.pitch);
-
-                // measure end-to-end latency
-                let pre_audio = Instant::now();
-                stream_count = set_all_streams_pan(audio.left, audio.right);
-                let audio_latency = pre_audio.elapsed().as_secs_f64() * 1000.0;
-
-                // track latency samples
-                latency_samples.push(audio_latency);
-                if latency_samples.len() > 30 {
-                    latency_samples.remove(0);
-                }
-                avg_latency_ms = latency_samples.iter().sum::<f64>() / latency_samples.len() as f64;
-
-                // render dashboard
+                // 7. render dashboard
                 render_dashboard(
                     &smoothed,
                     raw_yaw,
                     raw_pitch,
                     raw_roll,
-                    &audio,
+                    &spatial,
                     current_fps,
-                    stream_count,
-                    packet_count,
+                    &cached_node_id,
                     avg_latency_ms,
+                    packet_count,
+                    speaker_mode,
                 );
+                stdout().flush().ok();
 
-                last_update = Instant::now();
+                last_update_time = Instant::now();
             }
+            Ok(_) => continue, // bad packet size, skip
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::WouldBlock
                     && e.kind() != std::io::ErrorKind::TimedOut {
-                    eprintln!("❌ Socket error: {}", e);
+                    // don't print errors in raw mode, just continue
                 }
+                // sleep a tiny bit to save cpu when no data
+                std::thread::sleep(Duration::from_millis(5));
             }
         }
     }
+
+    Ok(())
 }
 
-// pipewire control
-fn set_all_streams_pan(left: f64, right: f64) -> usize {
-    let output = match Command::new("pw-cli")
-        .args(["list-objects", "Node"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return 0,
-    };
+// ==============================================================================
+// keyboard handling
+// ==============================================================================
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut updated_count = 0;
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
+enum KeyAction {
+    Quit,
+    Changed,
+    None,
+}
 
-    while i < lines.len() {
-        let line = lines[i];
+fn handle_key_event(
+    key: KeyEvent,
+    radius: &mut f64,
+    mode: &mut SpeakerMode,
+) -> KeyAction {
+    match key.code {
+        // quit keys
+        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => KeyAction::Quit,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyAction::Quit,
 
-        if line.trim().starts_with("id") && line.contains("PipeWire:Interface:Node") {
-            if let Some(id_str) = line.split_whitespace().nth(1) {
-                let id = id_str.trim_end_matches(',');
+        // radius control: up/down arrows
+        KeyCode::Up => {
+            *radius = (*radius + RADIUS_STEP).min(MAX_RADIUS);
+            KeyAction::Changed
+        }
+        KeyCode::Down => {
+            *radius = (*radius - RADIUS_STEP).max(MIN_RADIUS);
+            KeyAction::Changed
+        }
 
-                let mut j = i + 1;
-                let mut is_audio_output = false;
-
-                while j < lines.len() && j < i + 20 {
-                    let check_line = lines[j];
-
-                    if check_line.trim().starts_with("id") {
-                        break;
-                    }
-
-                    if check_line.contains("media.class")
-                        && check_line.contains("Stream/Output/Audio")
-                    {
-                        is_audio_output = true;
-                    }
-
-                    j += 1;
-                }
-
-                if is_audio_output {
-                    let result = Command::new("pw-cli")
-                        .args([
-                            "set-param",
-                            id,
-                            "Props",
-                            &format!("{{ \"channelVolumes\": [{:.3}, {:.3}] }}", left, right),
-                        ])
-                        .output();
-
-                    if let Ok(out) = result {
-                        if out.status.success() {
-                            updated_count += 1;
-                        }
-                    }
-                }
+        // speaker mode: w = front, s = back
+        KeyCode::Char('w') | KeyCode::Char('W') => {
+            if *mode != SpeakerMode::Front {
+                *mode = SpeakerMode::Front;
+                KeyAction::Changed
+            } else {
+                KeyAction::None
+            }
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            if *mode != SpeakerMode::Back {
+                *mode = SpeakerMode::Back;
+                KeyAction::Changed
+            } else {
+                KeyAction::None
             }
         }
 
-        i += 1;
+        _ => KeyAction::None,
     }
-
-    updated_count
 }
