@@ -11,10 +11,13 @@ Spatial audio for Linux.
     mkdir -p ~/.config/pipewire/pipewire.conf.d/
     mv conf/99-spatializer.conf ~/.config/pipewire/pipewire.conf.d/99-spatializer.conf
 ``` 
-3. Move SOFA file to `/usr/share/pipewire/sofa/`
+3. Move SOFA and reverb .wav files. 
 ```bash
     mkdir -p /usr/share/pipewire/sofa/
     mv assets/subject_021.sofa /usr/share/pipewire/sofa/
+
+    mkdir -p /usr/share/pipewire/convolver/
+    mv assets/reverb.wav /usr/share/pipewire/convolver/
 ```
 4. Restart pipewire
 ```bash

@@ -12,7 +12,7 @@ use crossterm::{
 
 
 // smoothing: higher = smoother but more latency (0.0 - 0.99)
-const SMOOTHING_FACTOR: f64 = 0.75;
+const SMOOTHING_FACTOR: f64 = 0.65;
 
 // min time between updates (20ms = ~50fps)
 const UPDATE_RATE_MS: u64 = 20;
@@ -25,6 +25,10 @@ const DEFAULT_RADIUS: f64 = 1.5;
 const MIN_RADIUS: f64 = 0.1;
 const MAX_RADIUS: f64 = 10.0;
 const RADIUS_STEP: f64 = 0.1;
+
+// dynamic reverb wet/dry mix depending on distance
+const MIN_REVERB: f64 = 0.05;  // closest
+const MAX_REVERB: f64 = 0.60;  // farthest
 
 // speaker angles for front and back modes
 const FRONT_LEFT_ANGLE: f64 = 30.0;   // +30° (front-left)
@@ -87,10 +91,11 @@ struct SpatialState {
     elevation: f64,
     radius: f64,
     gain: f64, // volume scaling based on radius (1.0 / radius)
+    reverb_gain: f64, // wet signal amount (0.0 - 1.0)
 }
 
 impl SpatialState {
-    fn from_head_tracking(yaw: f64, pitch: f64, radius: f64, mode: SpeakerMode) -> Self {
+    fn from_head_tracking(yaw: f64, pitch: f64, radius: f64, mode: SpeakerMode, reverb_enabled: bool) -> Self {
         // get base speaker angles based on mode
         let (left_base, right_base) = mode.base_angles();
 
@@ -106,7 +111,16 @@ impl SpatialState {
         // clamp to reasonable range
         let gain = (1.0 / radius).clamp(0.1, 2.0);
 
-        Self { left_az, right_az, elevation, radius, gain }
+        // calculate reverb gain using square-root curve for natural progression
+        // sqrt gives more reverb early on, then tapers - matches physical acoustics
+        let reverb_gain = if reverb_enabled {
+            let normalized = ((radius - MIN_RADIUS) / (MAX_RADIUS - MIN_RADIUS)).clamp(0.0, 1.0);
+            MIN_REVERB + normalized.sqrt() * (MAX_REVERB - MIN_REVERB)
+        } else {
+            0.0 // reverb disabled
+        };
+
+        Self { left_az, right_az, elevation, radius, gain, reverb_gain }
     }
 }
 
@@ -196,6 +210,7 @@ fn render_dashboard(
     latency_ms: f64,
     packets: u64,
     mode: SpeakerMode,
+    reverb_enabled: bool,
 ) {
     clear_screen();
 
@@ -251,6 +266,10 @@ fn render_dashboard(
     let gain_pct = spatial.gain * 100.0;
     draw_row(&format!("    \x1B[1;37mRadius:\x1B[0m    {:>6.2}m  (Gain: {:>3.0}%)", spatial.radius, gain_pct));
 
+    let reverb_pct = spatial.reverb_gain * 100.0;
+    let reverb_status = if reverb_enabled { "\x1B[1;32mON\x1B[0m" } else { "\x1B[1;31mOFF\x1B[0m" };
+    draw_row(&format!("    \x1B[1;37mReverb:\x1B[0m   {:>6.1}%  [{}]", reverb_pct, reverb_status));
+
     draw_row("");
     print!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m\r\n");
 
@@ -286,7 +305,7 @@ fn render_dashboard(
     print!("\x1B[1;96m╠══════════════════════════════════════════════════════════════════╣\x1B[0m\r\n");
 
     draw_row(&format!("  {}", "\x1B[1;90m⌨ CONTROLS\x1B[0m"));
-    draw_row("    \x1B[90m↑/↓\x1B[0m Radius   \x1B[90mW\x1B[0m Front   \x1B[90mS\x1B[0m Back   \x1B[90mQ/Esc\x1B[0m Quit");
+    draw_row("    \x1B[90m↑/↓\x1B[0m Radius   \x1B[90mW\x1B[0m Front   \x1B[90mS\x1B[0m Back   \x1B[90mR\x1B[0m Reverb   \x1B[90mQ/Esc\x1B[0m Quit");
     print!("\x1B[1;96m╚══════════════════════════════════════════════════════════════════╝\x1B[0m\r\n");
 }
 
@@ -321,7 +340,8 @@ fn find_spatializer_node() -> Option<String> {
 fn update_pipewire(id: &str, spatial: &SpatialState) {
     // build the json for the stereo filter-chain
     // sets params for both 'spat_left' and 'spat_right' nodes
-    // uses dynamic radius and includes gain for distance simulation
+    // uses dynamic radius and includes gain for reverb simulation
+    let dry_gain = 1.0 - spatial.reverb_gain;
     let json_payload = format!(
         "{{ \"params\": [ \
             \"spat_left:Azimuth\", {:.2}, \
@@ -331,10 +351,16 @@ fn update_pipewire(id: &str, spatial: &SpatialState) {
             \"spat_right:Azimuth\", {:.2}, \
             \"spat_right:Elevation\", {:.2}, \
             \"spat_right:Radius\", {:.2}, \
-            \"spat_right:Gain\", {:.2} \
+            \"spat_right:Gain\", {:.2}, \
+            \"final_mix_l:Gain 1\", {:.2}, \
+            \"final_mix_l:Gain 2\", {:.2}, \
+            \"final_mix_r:Gain 1\", {:.2}, \
+            \"final_mix_r:Gain 2\", {:.2} \
         ] }}",
         spatial.left_az, spatial.elevation, spatial.radius, spatial.gain,
-        spatial.right_az, spatial.elevation, spatial.radius, spatial.gain
+        spatial.right_az, spatial.elevation, spatial.radius, spatial.gain,
+        dry_gain, spatial.reverb_gain,
+        dry_gain, spatial.reverb_gain
     );
 
     // spawn async (fire and forget) to prevent frame drops
@@ -430,6 +456,7 @@ fn run_main_loop() -> Result<(), String> {
     // dynamic state: radius and speaker mode
     let mut current_radius: f64 = DEFAULT_RADIUS;
     let mut speaker_mode: SpeakerMode = SpeakerMode::Front;
+    let mut reverb_enabled: bool = false; // off by default
 
     // flag to force update when user changes settings
     let mut force_update = false;
@@ -438,7 +465,7 @@ fn run_main_loop() -> Result<(), String> {
         // 1. handle keyboard input (non-blocking)
         if event::poll(Duration::from_secs(0)).unwrap_or(false) {
             if let Ok(Event::Key(key_event)) = event::read() {
-                match handle_key_event(key_event, &mut current_radius, &mut speaker_mode) {
+                match handle_key_event(key_event, &mut current_radius, &mut speaker_mode, &mut reverb_enabled) {
                     KeyAction::Quit => break,
                     KeyAction::Changed => {
                         force_update = true;
@@ -479,6 +506,7 @@ fn run_main_loop() -> Result<(), String> {
                     smoothed.pitch,
                     current_radius,
                     speaker_mode,
+                    reverb_enabled,
                 );
 
                 // 5. send to pipewire (only if changed enough to avoid spamming, or forced)
@@ -527,6 +555,7 @@ fn run_main_loop() -> Result<(), String> {
                     avg_latency_ms,
                     packet_count,
                     speaker_mode,
+                    reverb_enabled,
                 );
                 stdout().flush().ok();
 
@@ -561,6 +590,7 @@ fn handle_key_event(
     key: KeyEvent,
     radius: &mut f64,
     mode: &mut SpeakerMode,
+    reverb_enabled: &mut bool,
 ) -> KeyAction {
     match key.code {
         // quit keys
@@ -593,6 +623,12 @@ fn handle_key_event(
             } else {
                 KeyAction::None
             }
+        }
+
+        // reverb toggle: r key
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            *reverb_enabled = !*reverb_enabled;
+            KeyAction::Changed
         }
 
         _ => KeyAction::None,
