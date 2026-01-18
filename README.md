@@ -25,7 +25,7 @@ Spatial audio for Linux.
 
 6. Run with `cargo run` or install 
 ```bash
-cargo build --release
+cargo build --release --target-dir ./target
 sudo cp target/release/spatial-track /usr/local/bin/ 
 ```
 ![screenshot](/assets/demo.png)
